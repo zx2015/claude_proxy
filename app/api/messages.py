@@ -57,7 +57,14 @@ async def messages_endpoint(
                             yield chunk
                 except Exception as e:
                     logger.error(f"Stream error: {str(e)}")
-                    yield f"data: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)}})}\n\n"
+                    # 尝试使用 handle_upstream_error 获取标准化的错误内容
+                    try:
+                        mapped_exc = handle_upstream_error(e)
+                        error_body = mapped_exc.detail
+                    except:
+                        error_body = {"error": {"type": "api_error", "message": str(e)}}
+
+                    yield f"data: {json.dumps({'type': 'error', **error_body})}\n\n"
                 finally:
                     await client.aclose()
 

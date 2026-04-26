@@ -1,13 +1,16 @@
 from typing import Dict
 from app.adapters.base import BaseAdapter
 from app.adapters.default import DefaultAdapter
+from app.adapters.deepseek import DeepSeekAdapter
+from app.adapters.qwen import QwenAdapter
 
 class AdapterFactory:
     def __init__(self):
         self._default_adapter = DefaultAdapter()
-        self._adapters: Dict[str, BaseAdapter] = {}
-        # 在此处注册特定模型的适配器，例如：
-        # self._adapters["deepseek"] = DeepSeekAdapter()
+        self._adapters: Dict[str, BaseAdapter] = {
+            "deepseek": DeepSeekAdapter(),
+            "qwen": QwenAdapter()
+        }
 
     def get_adapter(self, model_name: str) -> BaseAdapter:
         """
