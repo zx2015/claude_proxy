@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+httpx
+python-dotenv
+pydantic-settings
+pydantic>=2.0
+python-multipart
+# Test dependencies
+pytest
+pytest-asyncio
+respx
