@@ -1,4 +1,5 @@
 import uvicorn
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends
 from app.core.config import settings
@@ -7,14 +8,20 @@ from app.core.logging import setup_logging
 from app.api import models, messages
 from app.services.discovery import model_discovery
 
-# 初始化日志
+# 1. 初始化日志
 setup_logging()
+
+# 2. 屏蔽健康检查的访问日志 (防止刷屏)
+class HealthCheckFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/health" not in record.getMessage()
+
+# 获取 uvicorn 访问日志记录器并应用过滤器
+logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: 系统启动时的逻辑
     yield
-    # Shutdown: 系统关闭时的逻辑，释放资源
     await model_discovery.close()
 
 app = FastAPI(
@@ -32,14 +39,18 @@ async def health_check():
 async def root():
     return {"message": "Claude Proxy is running. Target: " + settings.litellm_url}
 
-# 挂载受保护的路由 (需校验 PROXY_API_KEY)
 app.include_router(models.router, prefix="/v1", dependencies=[Depends(verify_api_key)])
 app.include_router(messages.router, prefix="/v1", dependencies=[Depends(verify_api_key)])
 
 if __name__ == "__main__":
+    # 在容器中或生产环境建议显式关闭 reload 以节省 CPU
+    # 只有当 LOG_LEVEL 为 DEBUG 且非容器环境时才建议开启
+    should_reload = settings.log_level == "DEBUG"
+    
     uvicorn.run(
         "app.main:app",
         host=settings.host,
         port=settings.port,
-        reload=True if settings.log_level == "DEBUG" else False
+        reload=False, # 强制关闭热重载，彻底解决高 CPU 占用问题
+        access_log=True
     )
