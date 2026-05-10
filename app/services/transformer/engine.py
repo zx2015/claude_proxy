@@ -9,43 +9,40 @@ class ProtocolTransformer:
     def transform_request_to_openai(self, anthropic_req: Dict[str, Any]) -> Dict[str, Any]:
         """
         将 Anthropic 格式转换为标准的 OpenAI 请求格式。
-        使用防御性编程处理可能的缺失字段（如 description）。
+        集成 System Prompt 自动增强逻辑。
         """
+        model_name = anthropic_req.get("model", "default")
+        adapter = adapter_factory.get_adapter(model_name)
+        
         openai_req = {
-            "model": anthropic_req.get("model"),
+            "model": model_name,
             "messages": [],
             "stream": anthropic_req.get("stream", False),
             "max_tokens": anthropic_req.get("max_tokens", 1024),
             "temperature": anthropic_req.get("temperature", 0.7)
         }
 
-        # 1. 处理 System Prompt
-        system = anthropic_req.get("system")
-        if system:
-            if isinstance(system, str):
-                openai_req["messages"].append({"role": "system", "content": system})
-            elif isinstance(system, list):
-                # 处理数组形式的 system content (Anthropic 规范允许)
-                system_parts = []
-                for item in system:
-                    if item.get("type") == "text":
-                        system_parts.append(item.get("text", ""))
-                if system_parts:
-                    openai_req["messages"].append({"role": "system", "content": "\n".join(system_parts)})
+        # 1. 处理 System Prompt 并进行注入增强
+        system = anthropic_req.get("system", "")
+        if isinstance(system, list):
+            system_content = "\n".join([i.get("text", "") for i in system if i.get("type") == "text"])
+        else:
+            system_content = system
+            
+        # 调用适配器执行注入
+        enhanced_system = adapter.inject_system_prompt(system_content)
+        if enhanced_system:
+            openai_req["messages"].append({"role": "system", "content": enhanced_system})
 
         # 2. 处理 Messages
         for msg in anthropic_req.get("messages", []):
             role = msg["role"]
             content = msg["content"]
-
-            # Anthropic 允许 messages 数组中出现 role 为 "system" 的消息 (虽然不推荐，但为了兼容性)
+            
+            # 兼容 Anthropic 允许的 message 级别 system role
             if role == "system":
-                if isinstance(content, str):
-                    openai_req["messages"].append({"role": "system", "content": content})
-                elif isinstance(content, list):
-                    parts = [i.get("text", "") for i in content if i.get("type") == "text"]
-                    if parts:
-                        openai_req["messages"].append({"role": "system", "content": "\n".join(parts)})
+                msg_content = content if isinstance(content, str) else "\n".join([i.get("text", "") for i in content if i.get("type") == "text"])
+                openai_req["messages"].append({"role": "system", "content": adapter.inject_system_prompt(msg_content)})
                 continue
 
             new_msg = {"role": role}
@@ -69,23 +66,23 @@ class ProtocolTransformer:
                             "tool_call_id": item["tool_use_id"],
                             "content": str(item.get("content", ""))
                         })
-
+                
                 if text_parts:
                     new_msg["content"] = "\n".join(text_parts)
                 if tool_calls:
                     new_msg["tool_calls"] = tool_calls
-
+            
             if "content" in new_msg or "tool_calls" in new_msg:
                 openai_req["messages"].append(new_msg)
 
-        # 3. 处理 Tools (增加防御性处理)
+        # 3. 处理 Tools
         if anthropic_req.get("tools"):
             openai_req["tools"] = [
                 {
                     "type": "function",
                     "function": {
                         "name": t.get("name", "unknown"),
-                        "description": t.get("description", ""),  # 防御 KeyError: 'description'
+                        "description": t.get("description", ""),
                         "parameters": t.get("input_schema", {"type": "object", "properties": {}})
                     }
                 } for t in anthropic_req["tools"]
@@ -125,14 +122,13 @@ class ProtocolTransformer:
                     args = json.loads(tc["function"]["arguments"])
                 except:
                     args = tc["function"]["arguments"]
-
+                
                 anthropic_resp["content"].append({
                     "type": "tool_use",
                     "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
                     "name": tc["function"]["name"],
                     "input": args
                 })
-            # 如果有工具调用，强制 stop_reason 为 tool_use (OpenAI 有时在 tool_calls 时 finish_reason 为 stop)
             anthropic_resp["stop_reason"] = "tool_use"
 
         if not msg.get("tool_calls") and msg.get("content"):
@@ -148,7 +144,6 @@ class ProtocolTransformer:
         return anthropic_resp
 
     def _map_finish_reason(self, openai_reason: Optional[str]) -> str:
-        """将 OpenAI 的 finish_reason 映射为 Anthropic 的 stop_reason"""
         mapping = {
             "stop": "end_turn",
             "tool_calls": "tool_use",
@@ -159,12 +154,9 @@ class ProtocolTransformer:
         return mapping.get(openai_reason, "end_turn")
 
     def transform_response(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """处理已经是 Anthropic 格式但可能包含内联工具指令的响应"""
         model = data.get("model", "default")
         adapter = adapter_factory.get_adapter(model)
-        
         if "content" not in data: return data
-        
         new_content = []
         found = False
         for b in data["content"]:
@@ -176,7 +168,6 @@ class ProtocolTransformer:
                     found = True
                     continue
             new_content.append(b)
-            
         if found:
             data["content"] = new_content
             data["stop_reason"] = "tool_use"

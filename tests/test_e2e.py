@@ -159,6 +159,43 @@ async def test_count_tokens():
 
 @pytest.mark.anyio
 @respx.mock
+async def test_system_prompt_injection():
+    """验证系统提示词增强逻辑是否生效（针对 Qwen 模型）"""
+    # 1. 模拟上游响应
+    respx.post(f"{settings.litellm_url}/v1/chat/completions").mock(side_effect=lambda request: httpx.Response(
+        200, 
+        json={
+            "choices": [{"message": {"role": "assistant", "content": "I am Qwen and I see the injection."}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10},
+            "model": "qwen-max"
+        }
+    ))
+
+    # 2. 发送请求（模型名包含 qwen）
+    request_body = {
+        "model": "qwen-72b-chat",
+        "messages": [{"role": "user", "content": "hi"}],
+        "system": "Original system prompt"
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        await ac.post(
+            "/v1/messages", 
+            json=request_body, 
+            headers={"x-api-key": settings.proxy_api_key}
+        )
+    
+    # 3. 验证发往上游的请求是否包含注入内容
+    # 获取捕获到的最后一个请求
+    upstream_request = respx.calls.last.request
+    req_body = json.loads(upstream_request.read())
+    system_msg = next(m for m in req_body["messages"] if m["role"] == "system")
+    
+    assert "You are an expert at tool calling" in system_msg["content"]
+    assert "Original system prompt" in system_msg["content"]
+
+@pytest.mark.anyio
+@respx.mock
 async def test_anthropic_fallback_path(monkeypatch):
     """验证当关闭 OpenAI 路径偏好时，原生 Anthropic 转发路径依然工作"""
     # 1. 强制修改配置为使用 Anthropic 路径

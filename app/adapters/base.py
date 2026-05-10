@@ -17,6 +17,13 @@ class BaseAdapter(ABC):
         """
         pass
 
+    def inject_system_prompt(self, system_prompt: str) -> str:
+        """
+        根据模型特性增强系统提示词。
+        默认不进行任何修改。
+        """
+        return system_prompt
+
     def build_tool_use_block(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
         通用的工具块构建逻辑。
