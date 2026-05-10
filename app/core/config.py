@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     
+    # Protocol Strategy
+    # 是否优先走 OpenAI 兼容路径 (默认 True，因为更稳)
+    prefer_openai_path: bool = True
+
     # Logging
     log_level: str = "INFO"
 

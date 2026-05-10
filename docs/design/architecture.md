@@ -33,18 +33,15 @@
     - 若识别到工具调用，在流末尾手动注入 `content_block_start` (tool_use) 和 `content_block_stop` 事件。
     - 修正 `message_delta` 中的 `stop_reason` 状态。
 
+### 3.4 辅助路径 - Token 计数 (Token Counting Phase)
+1. **拦截**: 捕获 `/v1/messages/count_tokens` 请求。
+2. **处理策略**:
+    - **优先转发**: 尝试将请求转发至 LiteLLM（如果其后端模型支持）。
+    - **启发式兜底**: 若上游不支持，代理根据输入内容的字符长度进行估算（约 字符数 / 3），并返回符合 Anthropic 规范的响应。
+
 ## 4. 核心组件职责
 - **AuthMiddleware**: 负责入站 API Key 鉴权。
 - **ModelRegistry**: 动态拉取并管理 LiteLLM 的模型列表。
-- **ProtocolTransformer**: 执行 Anthropic 与其他协议间的结构转换与文本清洗。
+- **ProtocolTransformer**: 执行协议间的结构转换与文本清洗。
 - **StreamProcessor**: 维护流式状态机，处理 SSE 分片。
-- **ErrorHandler**: 统一拦截异常（如 429, 500），并将上游错误转换为 Anthropic 标准错误模型。
-
-## 5. 异常处理流程
-1. **拦截**: 捕获 `httpx.HTTPStatusError` 和 `httpx.RequestError` 等网络与协议异常。
-2. **映射**: 
-    - 429 -> `rate_limit_error`
-    - 500/503 -> `overloaded_error`
-    - 401/403 -> `authentication_error`
-    - Timeout -> `overloaded_error` (上游响应超时)
-3. **响应**: 返回 4xx/5xx HTTP 状态码，响应体严格遵循 Anthropic `ErrorResponse` 规范。
+- **ErrorHandler**: 统一拦截异常，提供标准错误模型。
