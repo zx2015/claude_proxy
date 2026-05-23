@@ -196,6 +196,44 @@ async def test_system_prompt_injection():
 
 @pytest.mark.anyio
 @respx.mock
+async def test_billing_header_stripping():
+    """验证 Claude 计费头（x-anthropic-billing-header）是否被正确清洗"""
+    # 1. 模拟上游响应
+    respx.post(f"{settings.litellm_url}/v1/chat/completions").mock(return_value=httpx.Response(
+        200, json={
+            "choices": [{"message": {"role": "assistant", "content": "Header stripped."}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5},
+            "model": "test-model"
+        }
+    ))
+
+    # 2. 发送包含计费头的请求
+    billing_header = "x-anthropic-billing-header: cc_version=2.1.37; cc_entrypoint=cli; cch=abc12;"
+    request_body = {
+        "model": "claude-3-5-sonnet",
+        "messages": [{"role": "user", "content": "hi"}],
+        "system": f"{billing_header}\nYou are a helpful assistant."
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        await ac.post(
+            "/v1/messages", 
+            json=request_body, 
+            headers={"x-api-key": settings.proxy_api_key}
+        )
+    
+    # 3. 验证发往上游的请求
+    upstream_request = respx.calls.last.request
+    req_body = json.loads(upstream_request.read())
+    system_msg = next(m for m in req_body["messages"] if m["role"] == "system")
+    
+    # 确认计费头已被移除
+    assert "x-anthropic-billing-header" not in system_msg["content"]
+    # 确认保留了原始内容
+    assert "You are a helpful assistant." in system_msg["content"]
+
+@pytest.mark.anyio
+@respx.mock
 async def test_anthropic_fallback_path(monkeypatch):
     """验证当关闭 OpenAI 路径偏好时，原生 Anthropic 转发路径依然工作"""
     # 1. 强制修改配置为使用 Anthropic 路径

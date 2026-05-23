@@ -6,10 +6,23 @@ from app.core.logging import logger
 from app.adapters.factory import adapter_factory
 
 class ProtocolTransformer:
+    def __init__(self):
+        # 计费头正则模式：匹配以 x-anthropic-billing-header: 开头直到行尾的内容
+        self.billing_header_pattern = re.compile(r'^x-anthropic-billing-header:.*$', re.MULTILINE)
+
+    def _strip_billing_header(self, text: str) -> str:
+        """从文本中移除 Claude Code 注入的计费头信息"""
+        if not text:
+            return text
+        cleaned = self.billing_header_pattern.sub("", text).strip()
+        if len(cleaned) < len(text):
+            logger.debug("Successfully stripped Claude billing header from prompt.")
+        return cleaned
+
     def transform_request_to_openai(self, anthropic_req: Dict[str, Any]) -> Dict[str, Any]:
         """
         将 Anthropic 格式转换为标准的 OpenAI 请求格式。
-        集成 System Prompt 自动增强逻辑。
+        集成 System Prompt 自动清洗与增强逻辑。
         """
         model_name = anthropic_req.get("model", "default")
         adapter = adapter_factory.get_adapter(model_name)
@@ -22,27 +35,30 @@ class ProtocolTransformer:
             "temperature": anthropic_req.get("temperature", 0.7)
         }
 
-        # 1. 处理 System Prompt 并进行注入增强
+        # 1. 处理 System Prompt 并进行清洗与注入增强
         system = anthropic_req.get("system", "")
         if isinstance(system, list):
             system_content = "\n".join([i.get("text", "") for i in system if i.get("type") == "text"])
         else:
             system_content = system
             
-        # 调用适配器执行注入
-        enhanced_system = adapter.inject_system_prompt(system_content)
+        # 先清洗计费头
+        clean_system = self._strip_billing_header(system_content)
+        # 再调用适配器执行注入
+        enhanced_system = adapter.inject_system_prompt(clean_system)
+        
         if enhanced_system:
             openai_req["messages"].append({"role": "system", "content": enhanced_system})
 
-        # 2. 处理 Messages
+        # 2. 处理 Messages (同样需要清洗消息中的 system 角色内容)
         for msg in anthropic_req.get("messages", []):
             role = msg["role"]
             content = msg["content"]
             
-            # 兼容 Anthropic 允许的 message 级别 system role
             if role == "system":
                 msg_content = content if isinstance(content, str) else "\n".join([i.get("text", "") for i in content if i.get("type") == "text"])
-                openai_req["messages"].append({"role": "system", "content": adapter.inject_system_prompt(msg_content)})
+                clean_msg = self._strip_billing_header(msg_content)
+                openai_req["messages"].append({"role": "system", "content": adapter.inject_system_prompt(clean_msg)})
                 continue
 
             new_msg = {"role": role}
@@ -91,9 +107,7 @@ class ProtocolTransformer:
         return openai_req
 
     def transform_openai_response_to_anthropic(self, openai_resp: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        将 OpenAI 的响应完美转回 Anthropic 格式。
-        """
+        """将 OpenAI 的响应完美转回 Anthropic 格式"""
         if not openai_resp.get("choices"):
             return openai_resp
             
