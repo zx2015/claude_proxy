@@ -2,6 +2,7 @@ import pytest
 import respx
 import json
 import httpx
+import logging
 from httpx import AsyncClient, ASGITransport
 from app.main import app
 from app.core.config import settings
@@ -77,6 +78,7 @@ async def test_messages_non_stream_transformation():
         )
     
     assert response.status_code == 200
+    assert response.headers.get("x-request-id")
     data = response.json()
     assert data["stop_reason"] == "tool_use"
     assert len(data["content"]) == 2
@@ -85,7 +87,7 @@ async def test_messages_non_stream_transformation():
 
 @pytest.mark.anyio
 @respx.mock
-async def test_messages_stream_openai_transformation():
+async def test_messages_stream_openai_transformation(caplog):
     """验证流式消息从 OpenAI 到 Anthropic 的转换"""
     async def openai_sse_stream():
         # OpenAI 格式的流
@@ -103,6 +105,7 @@ async def test_messages_stream_openai_transformation():
         "stream": True
     }
 
+    caplog.set_level(logging.INFO, logger="claude_proxy")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         response = await ac.post(
             "/v1/messages", 
@@ -112,11 +115,24 @@ async def test_messages_stream_openai_transformation():
     
     assert response.status_code == 200
     assert "text/event-stream" in response.headers["content-type"]
+    request_id = response.headers["x-request-id"]
     
     lines = [line async for line in response.aiter_lines() if line.strip()]
     # 期望包含 message_start, content_block_start, content_block_delta, content_block_stop, message_delta, message_stop
     assert any("message_start" in line for line in lines)
     assert any("Hello" in line for line in lines)
+    summaries = [
+        json.loads(record.message)
+        for record in caplog.records
+        if record.name == "claude_proxy" and record.message.startswith('{"timestamp"')
+    ]
+    summary = next(item for item in summaries if item.get("event") == "stream_summary")
+    assert summary["request_id"] == request_id
+    assert summary["upstream_sse_frames"] == 3
+    assert summary["upstream_json_frames"] == 2
+    assert summary["proxy_event_counts"]["message_start"] == 1
+    assert summary["proxy_message_stop_seen"] is True
+    assert summary["termination"] == "normal_eof"
 
 @pytest.mark.anyio
 @respx.mock
@@ -135,7 +151,9 @@ async def test_upstream_429_mapping():
     
     assert response.status_code == 429
     data = response.json()
-    assert data["detail"]["error"]["type"] == "rate_limit_error"
+    assert data["type"] == "error"
+    assert data["error"]["type"] == "rate_limit_error"
+    assert data["request_id"] == response.headers["x-request-id"]
 
 @pytest.mark.anyio
 async def test_count_tokens():

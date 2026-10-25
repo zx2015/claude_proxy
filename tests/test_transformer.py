@@ -5,12 +5,13 @@ import traceback
 # 将项目根目录添加到 python 路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from app.adapters.factory import adapter_factory
 from app.services.transformer.engine import transformer
 
 def test_xml_extraction():
     print("Testing XML extraction...")
     text = "I will list the files now. <tool_code>{\"name\": \"ls\", \"arguments\": {\"path\": \".\"}}</tool_code> Done."
-    tools, cleaned = transformer._extract_tools_from_text(text)
+    tools, cleaned = adapter_factory.get_adapter("default").detect_tool_calls(text)
     
     assert len(tools) == 1, f"Expected 1 tool, got {len(tools)}"
     assert tools[0]["name"] == "ls", f"Expected name 'ls', got {tools[0]['name']}"
@@ -22,7 +23,7 @@ def test_xml_extraction():
 def test_markdown_json_extraction():
     print("Testing Markdown JSON extraction...")
     text = "Here is the command:\n```json\n{\"command\": \"cat GEMINI.md\", \"tool\": \"bash\"}\n```\nLet me know if you need more."
-    tools, cleaned = transformer._extract_tools_from_text(text)
+    tools, cleaned = adapter_factory.get_adapter("default").detect_tool_calls(text)
     
     if len(tools) != 1:
         print(f"DEBUG: tools={tools}")

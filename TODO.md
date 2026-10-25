@@ -26,3 +26,5 @@
 - [x] 实现双协议路径支持（OpenAI & Anthropic）并通过全量 E2E 测试 — 2026-05-10
 - [x] 实现适配器系统的“系统提示词增强（System Prompt Injection）”逻辑 — 2026-05-10
 - [x] 实现 Claude 计费头（Billing Header）自动清洗逻辑 — 2026-05-22
+- [x] 增加流式响应诊断摘要并修复 Review 确认的 HTTPX 生命周期、Anthropic 错误/SSE block 协议和工具前缀缓冲问题 — 2026-10-25
+- [x] 统一两条流式路径的 Anthropic SSE error event，并让模型发现复用 lifespan HTTPX client — 2026-10-25

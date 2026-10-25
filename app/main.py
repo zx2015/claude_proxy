@@ -1,12 +1,15 @@
 import uvicorn
 import logging
+import httpx
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Request
+from fastapi.responses import JSONResponse
 from app.core.config import settings
 from app.core.auth import verify_api_key
 from app.core.logging import setup_logging
 from app.api import models, messages
-from app.services.discovery import model_discovery
+from app.core.request_context import RequestContextMiddleware, get_request_diagnostics
+from app.utils.error_handler import AnthropicUpstreamHTTPException
 
 # 1. 初始化日志
 setup_logging()
@@ -21,8 +24,12 @@ logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield
-    await model_discovery.close()
+    async with httpx.AsyncClient(timeout=600.0) as http_client:
+        app.state.http_client = http_client
+        try:
+            yield
+        finally:
+            del app.state.http_client
 
 app = FastAPI(
     title="Claude Proxy",
@@ -30,6 +37,18 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan
 )
+app.add_middleware(RequestContextMiddleware)
+
+
+@app.exception_handler(AnthropicUpstreamHTTPException)
+async def anthropic_upstream_error_handler(
+    request: Request, exc: AnthropicUpstreamHTTPException
+) -> JSONResponse:
+    content = dict(exc.detail) if isinstance(exc.detail, dict) else {"type": "error", "error": exc.detail}
+    request_context = get_request_diagnostics(request.scope.get("state", {}))
+    if request_context is not None:
+        content["request_id"] = request_context.request_id
+    return JSONResponse(status_code=exc.status_code, content=content)
 
 @app.get("/health")
 async def health_check():

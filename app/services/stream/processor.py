@@ -1,188 +1,293 @@
 import json
 import uuid
-import re
-from typing import AsyncGenerator, Optional, Dict, Any, List, Tuple
-from app.services.transformer.engine import transformer
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+
 from app.adapters.factory import adapter_factory
 from app.core.logging import logger
+from app.core.stream_diagnostics import StreamDiagnostics
+from app.services.transformer.engine import transformer
+
 
 class StreamProcessor:
-    def __init__(self, model_name: str = "default"):
+    def __init__(self, model_name: str = "default", diagnostics: Optional[StreamDiagnostics] = None):
         self.model_name = model_name
         self.adapter = adapter_factory.get_adapter(model_name)
-        
-        # 状态管理
+        self.diagnostics = diagnostics
+
         self.state = "FORWARDING"
-        self.text_buffer = "" # 累计所有已下发的文本
-        self.holding_buffer = "" # 拦截中的文本
-        self.max_hold_size = 2000 # 增加阈值，防止长 JSON 截断
-        
+        self.holding_buffer = ""
+        self.max_hold_size = 2000
         self.tool_use_emitted = False
         self.current_content_block_index = 0
-        self._pending_tools = []
-        
-        # 触发拦截的标志
-        self.triggers = ["<tool", "```json", "<think", "<call", "<tool_call", "Action:"]
+        self.text_block_index: Optional[int] = None
+        self.triggers = ["<tool_code>", "```json"]
 
     async def process_openai_stream(self, stream: AsyncGenerator[str, None]) -> AsyncGenerator[str, None]:
-        """
-        处理来自 LiteLLM 的 OpenAI 格式 SSE 流，实时清洗文本并转换为 Anthropic 格式。
-        """
+        """Convert an OpenAI SSE stream into serial Anthropic content blocks."""
         message_id = f"msg_{uuid.uuid4().hex[:24]}"
-        
-        # 1. 发送 message_start
-        yield f"data: {json.dumps({'type': 'message_start', 'message': {'id': message_id, 'type': 'message', 'role': 'assistant', 'model': self.model_name, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
-        
-        # 2. 发送第一个 content_block_start (text 类型)
-        yield f"data: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+        yield self._event(
+            {
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model_name,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            }
+        )
 
-        tool_calls_map = {} # 存储 OpenAI 结构化 tool_calls
+        tool_calls_map: Dict[int, Dict[str, Optional[str]]] = {}
         last_usage = {"input_tokens": 0, "output_tokens": 0}
         finish_reason = None
 
         async for line in stream:
-            if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+            if not line.startswith("data:"):
                 continue
-
+            data = line[5:].lstrip()
+            if data == "[DONE]":
+                continue
             try:
-                chunk = json.loads(line[6:])
-                
+                chunk = json.loads(data)
                 if chunk.get("usage"):
-                    u = chunk["usage"]
-                    last_usage["input_tokens"] = u.get("prompt_tokens", last_usage["input_tokens"])
-                    last_usage["output_tokens"] = u.get("completion_tokens", last_usage["output_tokens"])
+                    usage = chunk["usage"]
+                    last_usage["input_tokens"] = usage.get("prompt_tokens", last_usage["input_tokens"])
+                    last_usage["output_tokens"] = usage.get("completion_tokens", last_usage["output_tokens"])
 
                 choices = chunk.get("choices", [{}])
-                if not choices: continue
-                
-                if choices[0].get("finish_reason"):
-                    finish_reason = choices[0]["finish_reason"]
+                if not choices:
+                    continue
+                choice = choices[0]
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+                delta = choice.get("delta", {})
 
-                delta = choices[0].get("delta", {})
+                if delta.get("content"):
+                    for action, value in self._handle_text_delta(delta["content"]):
+                        if action == "text":
+                            async for event in self._emit_text_delta(value):
+                                yield event
+                        else:
+                            async for event in self._stop_text_block():
+                                yield event
+                            async for event in self._emit_structured_tool(value):
+                                yield event
 
-                # --- 核心逻辑：处理文本增量 ---
-                if "content" in delta and delta["content"]:
-                    text = delta["content"]
-                    
-                    # TODO: 实现实时拦截逻辑。
-                    # 当前策略：允许文本先流出以保证响应速度，在流末尾通过 detect_tool_calls 补发元数据。
-                    # 进阶优化方案 (Look-ahead Buffering):
-                    # 1. 发现触发词首字符时进入 PENDING 状态。
-                    # 2. 暂停转发，直至确认是工具指令（丢弃）还是普通文本（冲刷）。
-                    # 3. 为防止卡顿，需设定 MAX_HOLD_TIME 或 MAX_HOLD_SIZE。
-                    
-                    async for out_chunk in self._handle_text_delta(text):
-                        yield f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': out_chunk}})}\n\n"
-                    
-                    # 及时下发拦截并解析出的工具调用
-                    if self._pending_tools:
-                        for tool in self._pending_tools:
-                            async for tool_event in self._emit_structured_tool(tool):
-                                yield f"data: {json.dumps(tool_event)}\n\n"
-                        self._pending_tools = []
+                for tool_delta in delta.get("tool_calls", []) or []:
+                    index = tool_delta["index"]
+                    if index not in tool_calls_map:
+                        tool_calls_map[index] = {"id": None, "name": "", "arguments": ""}
+                    call = tool_calls_map[index]
+                    if tool_delta.get("id"):
+                        call["id"] = str(call.get("id") or "") + tool_delta["id"]
+                    function = tool_delta.get("function", {})
+                    if function.get("name"):
+                        call["name"] = str(call.get("name") or "") + function["name"]
+                    if function.get("arguments"):
+                        call["arguments"] = str(call.get("arguments") or "") + function["arguments"]
+            except Exception as exc:
+                if self.diagnostics is not None:
+                    self.diagnostics.record_processor_error(exc)
+                logger.error("StreamProcessor chunk parse failure: %s", type(exc).__name__)
 
-                # --- 核心逻辑：处理 OpenAI 原生结构化工具调用 ---
-                if "tool_calls" in delta and delta["tool_calls"]:
-                    for tc_delta in delta["tool_calls"]:
-                        idx = tc_delta["index"]
-                        if idx not in tool_calls_map:
-                            tool_calls_map[idx] = {"id": tc_delta.get("id"), "name": "", "arguments": ""}
-                        
-                        if tc_delta.get("id"): tool_calls_map[idx]["id"] = tc_delta["id"]
-                        if tc_delta.get("function", {}).get("name"): 
-                            tool_calls_map[idx]["name"] += tc_delta["function"]["name"]
-                        if tc_delta.get("function", {}).get("arguments"):
-                            tool_calls_map[idx]["arguments"] += tc_delta["function"]["arguments"]
-
-            except Exception as e:
-                logger.error(f"StreamProcessor: Error processing chunk: {e}")
-
-        # --- 流结束处理 ---
-        
-        if self.holding_buffer:
-            tools, remaining = self.adapter.detect_tool_calls(self.holding_buffer)
-            if tools:
-                for tool in tools:
-                    async for tool_event in self._emit_structured_tool(tool):
-                        yield f"data: {json.dumps(tool_event)}\n\n"
-                if remaining.strip():
-                    yield f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': remaining}})}\n\n"
+        for action, value in self._finish_holding_buffer():
+            if action == "text":
+                async for event in self._emit_text_delta(value):
+                    yield event
             else:
-                yield f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': self.holding_buffer}})}\n\n"
+                async for event in self._stop_text_block():
+                    yield event
+                async for event in self._emit_structured_tool(value):
+                    yield event
 
-        yield f"data: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+        async for event in self._stop_text_block():
+            yield event
 
-        for idx, tc in tool_calls_map.items():
+        for _, tool_call in sorted(tool_calls_map.items()):
             try:
-                args = json.loads(tc["arguments"])
-            except:
-                args = tc["arguments"]
-            
+                tool_input = json.loads(str(tool_call.get("arguments") or "{}"))
+                if not isinstance(tool_input, dict):
+                    raise ValueError("Tool input must be a JSON object")
+            except (json.JSONDecodeError, ValueError):
+                if self.diagnostics is not None:
+                    self.diagnostics.record_processor_error(ValueError("Invalid tool arguments"))
+                tool_input = {}
             tool_block = {
                 "type": "tool_use",
-                "id": tc["id"] or f"toolu_{uuid.uuid4().hex[:24]}",
-                "name": tc["name"],
-                "input": args
+                "id": tool_call.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+                "name": tool_call.get("name") or "unknown",
+                "input": tool_input,
             }
-            async for tool_event in self._emit_structured_tool(tool_block):
-                yield f"data: {json.dumps(tool_event)}\n\n"
+            async for event in self._emit_structured_tool(tool_block):
+                yield event
 
         stop_reason = transformer._map_finish_reason(finish_reason)
-        if self.tool_use_emitted:
+        if self.tool_use_emitted or tool_calls_map:
             stop_reason = "tool_use"
+        yield self._event(
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": last_usage["output_tokens"]},
+            }
+        )
+        yield self._event({"type": "message_stop"})
 
-        yield f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': last_usage['output_tokens']}})}\n\n"
-        yield f"data: {json.dumps({'type': 'message_stop'})}\n\n"
-
-    async def _handle_text_delta(self, text: str) -> AsyncGenerator[str, None]:
-        """
-        内部状态机：处理文本片段，决定转发还是拦截。
-        """
-        if self.state == "FORWARDING":
-            has_trigger = False
-            trigger_pos = -1
+    def _find_trigger_candidate(self, text: str) -> Optional[Tuple[int, bool]]:
+        """Return the earliest full trigger or suffix that may complete one."""
+        for position in range(len(text)):
+            suffix = text[position:]
             for trigger in self.triggers:
-                pos = text.find(trigger[0])
-                if pos != -1:
-                    # 二次确认，防止过度拦截
-                    potential_trigger = text[pos:pos+len(trigger)]
-                    if any(t.startswith(potential_trigger) for t in self.triggers):
-                        has_trigger = True
-                        trigger_pos = pos
-                        break
-            
-            if has_trigger:
-                if trigger_pos > 0:
-                    yield text[:trigger_pos]
-                self.holding_buffer = text[trigger_pos:]
-                self.state = "HOLDING"
-            else:
-                yield text
-                
-        elif self.state == "HOLDING":
-            self.holding_buffer += text
-            tools, remaining = self.adapter.detect_tool_calls(self.holding_buffer)
-            
-            if tools:
-                self._pending_tools.extend(tools)
-                self.tool_use_emitted = True
-                self.holding_buffer = remaining
-                if not any(t[0] in self.holding_buffer for t in self.triggers):
-                    self.state = "FORWARDING"
-                    if self.holding_buffer:
-                        yield self.holding_buffer
-                        self.holding_buffer = ""
-            
-            elif len(self.holding_buffer) > self.max_hold_size:
-                yield self.holding_buffer
-                self.holding_buffer = ""
-                self.state = "FORWARDING"
+                if suffix.startswith(trigger):
+                    return position, True
+                if len(suffix) < len(trigger) and trigger.startswith(suffix):
+                    return position, False
+        return None
 
-    async def _emit_structured_tool(self, tool_block: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
+    def _handle_text_delta(self, text: str) -> List[Tuple[str, Any]]:
+        if not text:
+            return []
+        if self.state == "HOLDING":
+            self.holding_buffer += text
+            return self._process_holding_buffer()
+
+        candidate = self._find_trigger_candidate(text)
+        if candidate is None:
+            return [("text", text)]
+
+        position, _ = candidate
+        actions: List[Tuple[str, Any]] = []
+        if position:
+            actions.append(("text", text[:position]))
+        self.holding_buffer = text[position:]
+        self.state = "HOLDING"
+        actions.extend(self._process_holding_buffer())
+        return actions
+
+    def _process_holding_buffer(self) -> List[Tuple[str, Any]]:
+        detect_with_spans = getattr(self.adapter, "detect_tool_calls_with_spans", None)
+        remaining = ""
+        if detect_with_spans is not None:
+            tools, _, spans = detect_with_spans(self.holding_buffer)
+        else:
+            tools, remaining = self.adapter.detect_tool_calls(self.holding_buffer)
+            spans = []
+
+        if tools:
+            original = self.holding_buffer
+            self.holding_buffer = ""
+            self.state = "FORWARDING"
+            self.tool_use_emitted = True
+            actions: List[Tuple[str, Any]] = []
+            if len(spans) != len(tools):
+                if remaining:
+                    actions.append(("text", remaining))
+                actions.extend(("tool", tool) for tool in tools)
+                return actions
+
+            cursor = 0
+            for tool, (start, end) in zip(tools, spans):
+                if start > cursor:
+                    actions.extend(self._handle_text_delta(original[cursor:start]))
+                actions.append(("tool", tool))
+                cursor = end
+            if cursor < len(original):
+                actions.extend(self._handle_text_delta(original[cursor:]))
+            return actions
+
+        candidate = self._find_trigger_candidate(self.holding_buffer)
+        if candidate is None:
+            plain_text = self.holding_buffer
+            self.holding_buffer = ""
+            self.state = "FORWARDING"
+            return [("text", plain_text)] if plain_text else []
+
+        position, full_trigger = candidate
+        if position:
+            plain_text = self.holding_buffer[:position]
+            self.holding_buffer = self.holding_buffer[position:]
+            return [("text", plain_text)]
+
+        if len(self.holding_buffer) > self.max_hold_size:
+            plain_text = self.holding_buffer
+            self.holding_buffer = ""
+            self.state = "FORWARDING"
+            return [("text", plain_text)]
+
+        # Keep complete tool prefixes until their closing syntax arrives;
+        # retain partial prefixes only while they can still match a trigger.
+        if not full_trigger and len(self.holding_buffer) > max(map(len, self.triggers)):
+            plain_text = self.holding_buffer
+            self.holding_buffer = ""
+            self.state = "FORWARDING"
+            return [("text", plain_text)]
+        return []
+
+    def _finish_holding_buffer(self) -> List[Tuple[str, Any]]:
+        if not self.holding_buffer:
+            return []
+        actions = self._process_holding_buffer()
+        if self.holding_buffer:
+            plain_text = self.holding_buffer
+            self.holding_buffer = ""
+            self.state = "FORWARDING"
+            actions.append(("text", plain_text))
+        return actions
+
+    async def _emit_text_delta(self, text: str) -> AsyncGenerator[str, None]:
+        if not text:
+            return
+        if self.text_block_index is None:
+            self.text_block_index = self.current_content_block_index
+            self.current_content_block_index += 1
+            yield self._event(
+                {
+                    "type": "content_block_start",
+                    "index": self.text_block_index,
+                    "content_block": {"type": "text", "text": ""},
+                }
+            )
+        yield self._event(
+            {
+                "type": "content_block_delta",
+                "index": self.text_block_index,
+                "delta": {"type": "text_delta", "text": text},
+            }
+        )
+
+    async def _stop_text_block(self) -> AsyncGenerator[str, None]:
+        if self.text_block_index is None:
+            return
+        yield self._event({"type": "content_block_stop", "index": self.text_block_index})
+        self.text_block_index = None
+
+    async def _emit_structured_tool(self, tool_block: Dict[str, Any]) -> AsyncGenerator[str, None]:
+        index = self.current_content_block_index
         self.current_content_block_index += 1
-        idx = self.current_content_block_index
-        yield {"type": "content_block_start", "index": idx, "content_block": tool_block}
-        yield {"type": "content_block_stop", "index": idx}
+        self.tool_use_emitted = True
+        tool_start = {**tool_block, "input": {}}
+        yield self._event(
+            {"type": "content_block_start", "index": index, "content_block": tool_start}
+        )
+        partial_json = json.dumps(
+            tool_block.get("input", {}), ensure_ascii=False, separators=(",", ":")
+        )
+        yield self._event(
+            {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": partial_json},
+            }
+        )
+        yield self._event({"type": "content_block_stop", "index": index})
+
+    @staticmethod
+    def _event(event: Dict[str, Any]) -> str:
+        return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
     async def process_anthropic_stream(self, stream: AsyncGenerator[str, None]) -> AsyncGenerator[str, None]:
         async for line in stream:

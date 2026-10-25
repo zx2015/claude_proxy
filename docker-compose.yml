@@ -1,6 +1,9 @@
 services:
   claude-proxy:
-    build: .
+    build:
+      context: .
+      args:
+        APP_BUILD_ID: ${APP_BUILD_ID:-unknown}
     container_name: claude-proxy
     ports:
       - "${PORT:-8000}:${PORT:-8000}"

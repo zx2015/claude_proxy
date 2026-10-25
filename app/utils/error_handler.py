@@ -3,7 +3,11 @@ from fastapi import HTTPException, status
 from app.models.anthropic import ErrorResponse, ErrorDetail
 from app.core.logging import logger
 
-def handle_upstream_error(e: Exception) -> HTTPException:
+class AnthropicUpstreamHTTPException(HTTPException):
+    """Upstream errors whose body follows Anthropic's top-level error schema."""
+
+
+def handle_upstream_error(e: Exception) -> AnthropicUpstreamHTTPException:
     """
     将上游异常转换为 Anthropic 规范的错误响应。
     """
@@ -42,14 +46,19 @@ def handle_upstream_error(e: Exception) -> HTTPException:
         message = "Upstream request timed out."
         status_code = status.HTTP_504_GATEWAY_TIMEOUT
 
-    logger.error(f"Mapping upstream error: {status_code} -> {error_type}: {message}")
+    logger.error(
+        "Mapping upstream error: status=%s type=%s exception=%s",
+        status_code,
+        error_type,
+        type(e).__name__,
+    )
 
     # 构造 Anthropic 格式的 Body
     error_content = ErrorResponse(
         error=ErrorDetail(type=error_type, message=message)
     ).model_dump()
 
-    return HTTPException(
+    return AnthropicUpstreamHTTPException(
         status_code=status_code,
         detail=error_content
     )

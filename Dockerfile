@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 
+ARG APP_BUILD_ID=unknown
+ENV APP_BUILD_ID=${APP_BUILD_ID}
+
 WORKDIR /app
 
 # 安装 curl 用于健康检查

@@ -17,6 +17,8 @@ class Settings(BaseSettings):
 
     # Logging
     log_level: str = "INFO"
+    stream_diagnostics_enabled: bool = True
+    app_build_id: str = "unknown"
 
     model_config = SettingsConfigDict(
         env_file=".env",

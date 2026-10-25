@@ -13,8 +13,15 @@ class DefaultAdapter(BaseAdapter):
         self.md_json_pattern = re.compile(r'```json\s*(.*?)\s*```', re.DOTALL)
 
     def detect_tool_calls(self, text: str) -> Tuple[List[Dict[str, Any]], str]:
+        tools, cleaned_text, _ = self.detect_tool_calls_with_spans(text)
+        return tools, cleaned_text
+
+    def detect_tool_calls_with_spans(
+        self, text: str
+    ) -> Tuple[List[Dict[str, Any]], str, List[Tuple[int, int]]]:
+        """Return tool blocks and source spans for ordered streaming emission."""
         tools = []
-        cleaned_text = text
+        spans: List[Tuple[int, int]] = []
 
         # 1. 尝试匹配 XML 格式
         for match in self.xml_pattern.finditer(text):
@@ -22,7 +29,7 @@ class DefaultAdapter(BaseAdapter):
                 raw_json = match.group(1).strip()
                 tool_data = json.loads(raw_json)
                 tools.append(self.build_tool_use_block(tool_data))
-                cleaned_text = cleaned_text.replace(match.group(0), "")
+                spans.append(match.span())
             except Exception as e:
                 logger.warning(f"DefaultAdapter: Failed to parse XML: {str(e)}")
 
@@ -34,8 +41,11 @@ class DefaultAdapter(BaseAdapter):
                     tool_data = json.loads(raw_json)
                     if any(k in tool_data for k in ["name", "tool", "command", "arguments"]):
                         tools.append(self.build_tool_use_block(tool_data))
-                        cleaned_text = cleaned_text.replace(match.group(0), "")
+                        spans.append(match.span())
                 except Exception as e:
                     logger.warning(f"DefaultAdapter: Failed to parse MD JSON: {str(e)}")
 
-        return tools, cleaned_text
+        cleaned_text = text
+        for start, end in reversed(spans):
+            cleaned_text = cleaned_text[:start] + cleaned_text[end:]
+        return tools, cleaned_text, spans

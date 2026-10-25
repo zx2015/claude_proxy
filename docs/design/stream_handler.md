@@ -36,3 +36,30 @@
 ## 5. 优化目标
 - **0 延迟感知**: 普通对话无拦截延迟。
 - **UI 纯净**: 绝不显示原始指令文本。
+
+## 6. Anthropic Content Block 串行生命周期
+
+Anthropic 流式响应中的 content block 按顺序完成：一个 block 必须先输出 `content_block_stop`，之后才能输出下一个 block 的 `content_block_start`。文本与工具调用混合时，关闭当前文本块后再发送工具块；若后续仍有文本，则使用新的递增 index 开启文本块。
+
+工具块通过以下事件序列输出：
+
+1. `content_block_start`，`content_block.type` 为 `tool_use`，`input` 初始为空对象。
+2. 一个或多个 `content_block_delta`，`delta.type` 为 `input_json_delta`，`partial_json` 拼接后是完整 JSON。
+3. `content_block_stop`。
+
+仅有原生工具调用且没有文本时，不创建空的 text block。触发词扫描要区分完整触发词和位于数据块尾部、仍可能跨块补全的前缀；确认无效的短前缀应立即冲刷，避免普通代码或数学文本被长时间缓冲。
+
+当前 `DefaultAdapter` 实际识别 `<tool_code>` 和以 `json` 标记的 Markdown fenced code block，因此流式扫描只对这两个开头做跨块预判；单个 `<`、不支持的 `<think`/`<call` 等前缀不会被当作可解析工具调用长期持有。
+
+当前 `DefaultAdapter` 实际识别 `<tool_code>` 和 ````json` 两种格式，因此流式扫描只对这两个开头做跨块预判；单个 `<`、不支持的 `<think`/`<call` 等前缀不会被当作可解析工具调用长期持有。
+
+## 7. 流中途错误事件
+
+`StreamingResponse` 一旦发送 HTTP 响应头，后续异常不能再通过 FastAPI 异常处理器改成普通 JSON 错误响应。OpenAI 转换路径和 Anthropic passthrough 路径都应在生成器内将可恢复的上游/处理异常映射为 Anthropic SSE error event：
+
+```text
+event: error
+data: {"type":"error","error":{"type":"api_error","message":"..."}}
+```
+
+错误帧之后结束流，不继续发送正常结束事件。`CancelledError` 仍单独向上传播，不转换为 error event。错误消息使用安全的通用说明，避免把异常对象中的 URL、响应正文或其他内部信息发送给客户端。
