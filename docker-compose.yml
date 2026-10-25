@@ -1,10 +1,11 @@
 services:
   claude-proxy:
+    image: claude-proxy:latest
     build:
       context: .
       args:
         APP_BUILD_ID: ${APP_BUILD_ID:-unknown}
-    container_name: claude-proxy
+    container_name: claude-proxy-server
     ports:
       - "${PORT:-8000}:${PORT:-8000}"
     env_file:
